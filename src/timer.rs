@@ -1,34 +1,72 @@
 use std::sync::Arc;
 
 use tokio_cron_scheduler::{Job, JobScheduler};
+use uuid::Uuid;
 
 use crate::{boil::BoilClient, config::Config, core::do_reconnect};
 
-/// 启动 cron 调度器，自动换 IP 并通过 TG 通知（如已配置）
-pub async fn start(config: Arc<Config>) -> anyhow::Result<JobScheduler> {
+/// 定时换 IP 管理器：持有运行中的调度器，支持运行时动态增删任务（无需重启进程）。
+pub struct TimerManager {
+    sched: JobScheduler,
+    config: Arc<Config>,
+    job_id: Option<Uuid>,
+    /// 当前生效的 cron 表达式（None 表示未启用），供查询展示
+    current: Option<String>,
+}
+
+impl TimerManager {
+    /// 创建并启动一个空调度器（尚无任务）
+    pub async fn new(config: Arc<Config>) -> anyhow::Result<Self> {
+        let sched = JobScheduler::new().await?;
+        sched.start().await?;
+        Ok(Self { sched, config, job_id: None, current: None })
+    }
+
+    /// 当前生效的 cron 表达式
+    pub fn current(&self) -> Option<String> {
+        self.current.clone()
+    }
+
+    /// 设置/替换定时任务，立即生效（先移除旧任务再添加新任务）
+    pub async fn set(&mut self, expr: &str) -> anyhow::Result<()> {
+        self.clear().await?;
+
+        // tokio-cron-scheduler 用 6字段（秒 分 时 日 月 周），我们在前面补 "0 "
+        let full_expr = format!("0 {}", expr.trim());
+        let cfg = self.config.clone();
+        let job = Job::new_async(&full_expr, move |_uuid, _lock| {
+            let cfg = cfg.clone();
+            Box::pin(async move {
+                run_auto_change(&cfg).await;
+            })
+        })?;
+
+        self.job_id = Some(self.sched.add(job).await?);
+        self.current = Some(expr.trim().to_string());
+        log::info!("定时换 IP 已生效，cron: {expr}");
+        Ok(())
+    }
+
+    /// 清除当前定时任务，立即生效
+    pub async fn clear(&mut self) -> anyhow::Result<()> {
+        if let Some(id) = self.job_id.take() {
+            self.sched.remove(&id).await?;
+            log::info!("定时换 IP 已清除");
+        }
+        self.current = None;
+        Ok(())
+    }
+}
+
+/// 纯定时守护模式入口（无 TG）：按配置的 cron 启动一个长驻调度器
+pub async fn start(config: Arc<Config>) -> anyhow::Result<TimerManager> {
     let expr = match &config.change_cron {
         Some(e) => e.clone(),
         None => anyhow::bail!("未配置 CHANGE_CRON"),
     };
-
-    let sched = JobScheduler::new().await?;
-
-    // tokio-cron-scheduler 用 6字段（秒 分 时 日 月 周），我们在前面补 "0 "
-    let full_expr = format!("0 {}", expr.trim());
-    let cfg = config.clone();
-
-    let job = Job::new_async(&full_expr, move |_uuid, _lock| {
-        let cfg = cfg.clone();
-        Box::pin(async move {
-            run_auto_change(&cfg).await;
-        })
-    })?;
-
-    sched.add(job).await?;
-    sched.start().await?;
-
-    log::info!("定时换 IP 已启动，cron: {expr}");
-    Ok(sched)
+    let mut mgr = TimerManager::new(config).await?;
+    mgr.set(&expr).await?;
+    Ok(mgr)
 }
 
 async fn run_auto_change(config: &Config) {

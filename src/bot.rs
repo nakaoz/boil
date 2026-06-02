@@ -6,10 +6,13 @@ use teloxide::{
     utils::command::BotCommands,
 };
 
+use tokio::sync::Mutex;
+
 use crate::{
     boil::BoilClient,
     config::{save_cron, validate_cron, Config},
     core::{check_ip_quality, do_reconnect},
+    timer::TimerManager,
 };
 
 #[derive(BotCommands, Clone)]
@@ -38,17 +41,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let config = Arc::new(config);
 
-    // 若配置了 cron，启动定时调度器
-    if config.change_cron.is_some() {
-        let cfg = config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::timer::start(cfg).await {
-                log::error!("定时器启动失败: {e}");
-            } else {
-                // 保持调度器存活
-                loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
-            }
-        });
+    // 定时器管理器：共享给命令处理器，实现 /timer 运行时热更新（无需重启进程）
+    let timer = Arc::new(Mutex::new(TimerManager::new(config.clone()).await?));
+    if let Some(cron) = &config.change_cron {
+        if let Err(e) = timer.lock().await.set(cron).await {
+            log::error!("定时器启动失败: {e}");
+        }
     }
 
     let handler = dptree::entry()
@@ -60,7 +58,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config])
+        .dependencies(dptree::deps![config, timer])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -74,6 +72,7 @@ async fn handle_command(
     msg: Message,
     cmd: Command,
     config: Arc<Config>,
+    timer: Arc<Mutex<TimerManager>>,
 ) -> ResponseResult<()> {
     let chat_id_str = msg.chat.id.to_string();
     if config.tg_chat_id.as_deref() != Some(&chat_id_str) {
@@ -91,7 +90,7 @@ async fn handle_command(
         Command::Status => tg_status(&bot, msg.chat.id, &config).await,
         Command::Check => tg_check(&bot, msg.chat.id, &config).await,
         Command::Change => tg_change(&bot, msg.chat.id, &config).await,
-        Command::Timer(arg) => tg_timer(&bot, msg.chat.id, &config, arg.trim()).await,
+        Command::Timer(arg) => tg_timer(&bot, msg.chat.id, &timer, arg.trim()).await,
     }
     Ok(())
 }
@@ -193,7 +192,8 @@ async fn tg_check(bot: &Bot, chat_id: ChatId, config: &Config) {
     }
 
     // 流媒体检测：仅在本机 IP 与 Boil VPS IP 一致时才有意义
-    let boil_ips: Vec<String> = data.changeable()
+    // 用全部服务器（含 NAT 不可换）的 IP 比对，否则本机若是 NAT 机会被误判
+    let boil_ips: Vec<String> = data.zone_items
         .iter()
         .filter_map(|r| data.get_ip(&r.router_id, &r.interface))
         .map(str::to_string)
@@ -223,10 +223,11 @@ async fn tg_check(bot: &Bot, chat_id: ChatId, config: &Config) {
         .await;
 }
 
-async fn tg_timer(bot: &Bot, chat_id: ChatId, config: &Config, arg: &str) {
-    // 无参数：显示当前设置
+async fn tg_timer(bot: &Bot, chat_id: ChatId, timer: &Arc<Mutex<TimerManager>>, arg: &str) {
+    // 无参数：显示当前设置（从运行中的调度器读，保证与实际生效状态一致）
     if arg.is_empty() {
-        let msg = match &config.change_cron {
+        let current = timer.lock().await.current();
+        let msg = match current {
             Some(cron) => format!("⏰ 当前定时换 IP: <code>{cron}</code>\n\n关闭: /timer off\n修改示例:\n  每6小时: /timer 0 */6 * * *\n  每天3点: /timer 0 3 * * *"),
             None => "⏰ 定时换 IP 未启用\n\n设置示例:\n  每6小时: /timer 0 */6 * * *\n  每天3点: /timer 0 3 * * *".to_string(),
         };
@@ -234,30 +235,39 @@ async fn tg_timer(bot: &Bot, chat_id: ChatId, config: &Config, arg: &str) {
         return;
     }
 
-    // off：关闭定时
+    // off：关闭定时（先持久化，再热更新运行中的调度器）
     if arg.eq_ignore_ascii_case("off") {
-        match save_cron(None) {
-            Ok(_) => { let _ = bot.send_message(chat_id, "✅ 定时换 IP 已关闭（重启后生效）").await; }
-            Err(e) => { let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await; }
+        if let Err(e) = save_cron(None) {
+            let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await;
+            return;
+        }
+        match timer.lock().await.clear().await {
+            Ok(_) => { let _ = bot.send_message(chat_id, "✅ 定时换 IP 已关闭，立即生效").await; }
+            Err(e) => { let _ = bot.send_message(chat_id, format!("⚠️ 已写入配置，但热更新失败，重启后生效: {e}")).await; }
         }
         return;
     }
 
-    // 验证并保存 cron 表达式
-    match validate_cron(arg) {
-        Ok(_) => match save_cron(Some(arg)) {
-            Ok(_) => {
-                let _ = bot.send_message(
-                    chat_id,
-                    format!("✅ 定时换 IP 已设置: <code>{arg}</code>\n重启 boil 后生效"),
-                )
-                .parse_mode(ParseMode::Html)
-                .await;
-            }
-            Err(e) => { let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await; }
-        },
+    // 验证 → 持久化 → 热更新运行中的调度器
+    if let Err(e) = validate_cron(arg) {
+        let _ = bot.send_message(chat_id, format!("❌ {e}\n\n示例:\n  每6小时: 0 */6 * * *\n  每天3点: 0 3 * * *")).await;
+        return;
+    }
+    if let Err(e) = save_cron(Some(arg)) {
+        let _ = bot.send_message(chat_id, format!("❌ 保存失败: {e}")).await;
+        return;
+    }
+    match timer.lock().await.set(arg).await {
+        Ok(_) => {
+            let _ = bot.send_message(
+                chat_id,
+                format!("✅ 定时换 IP 已设置: <code>{arg}</code>，立即生效"),
+            )
+            .parse_mode(ParseMode::Html)
+            .await;
+        }
         Err(e) => {
-            let _ = bot.send_message(chat_id, format!("❌ {e}\n\n示例:\n  每6小时: 0 */6 * * *\n  每天3点: 0 3 * * *")).await;
+            let _ = bot.send_message(chat_id, format!("⚠️ 已写入配置，但热更新失败，重启后生效: {e}")).await;
         }
     }
 }
@@ -357,14 +367,17 @@ async fn tg_do_reconnect(
 }
 
 async fn get_local_public_ip() -> Option<String> {
-    reqwest::Client::new()
-        .get("https://api.ipify.org")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
+    let client = reqwest::Client::new();
+    // 多源兜底：单一服务超时/被墙时仍能拿到本机公网 IP，避免误判为非 VPS
+    for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"] {
+        if let Ok(resp) = client.get(url).timeout(Duration::from_secs(5)).send().await {
+            if let Ok(text) = resp.text().await {
+                let ip = text.trim().to_string();
+                if !ip.is_empty() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
 }
