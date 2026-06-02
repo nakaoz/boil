@@ -124,6 +124,23 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
     }
     println!();
 
+    // 登录成功后立即保存 Boil 账密（保留已有 TG 配置）
+    let save_path = setup_save_path();
+    let existing = std::fs::read_to_string(&save_path).unwrap_or_default();
+    let tg_lines: String = existing
+        .lines()
+        .filter(|l| l.starts_with("TG_") || l.starts_with("CHANGE_CRON="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let boil_content = format!(
+        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\n{}",
+        account,
+        password.replace('\'', "'\\''"),
+        tg_lines,
+    );
+    std::fs::write(&save_path, &boil_content)?;
+    println!("✅ 账号已保存到 {}\n", save_path.display());
+
     // TG 可选
     let want_tg = Select::new()
         .with_prompt("配置 Telegram Bot（用于远程控制）")
@@ -131,12 +148,11 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
         .default(0)
         .interact()? == 0;
 
-    let (tg_token, tg_chat_id) = if want_tg {
+    if want_tg {
         let token: String = Input::new()
             .with_prompt("Bot Token（从 @BotFather 获取）")
             .interact_text()?;
 
-        // 循环重试，直到检测到 chat_id
         let chat_id = loop {
             let _: String = Input::new()
                 .with_prompt("先向机器人发任意消息，然后按回车检测")
@@ -153,24 +169,14 @@ pub async fn run_setup_wizard() -> anyhow::Result<()> {
                 }
             }
         };
-        (Some(token), Some(chat_id))
+
+        // 追加写入 TG 配置
+        let updated = format!("{boil_content}TG_TOKEN='{token}'\nTG_CHAT_ID='{chat_id}'\n");
+        std::fs::write(&save_path, &updated)?;
+        println!("✅ TG 配置已保存\n");
     } else {
         println!("已跳过 Telegram 配置，可使用 boil status/change 命令行操作\n");
-        (None, None)
-    };
-
-    let mut content = format!(
-        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\n",
-        account,
-        password.replace('\'', "'\\''"),
-    );
-    if let (Some(token), Some(chat_id)) = (tg_token, tg_chat_id) {
-        content.push_str(&format!("TG_TOKEN='{}'\nTG_CHAT_ID='{}'\n", token, chat_id));
     }
-
-    let save_path = setup_save_path();
-    std::fs::write(&save_path, &content)?;
-    println!("✅ 配置已保存到 {}\n", save_path.display());
     println!("常用命令:");
     println!("  boil status    查看当前 IP");
     println!("  boil check     检查 IP 质量和流媒体解锁");
