@@ -49,13 +49,22 @@ echo ""
 echo "✅ 安装完成: $INSTALL_DIR/$BIN_NAME"
 echo ""
 
-# 首次配置
-"$INSTALL_DIR/$BIN_NAME" setup
+# 已有配置则跳过向导，仅首次安装时运行
+if [ ! -f "/etc/redial/config.env" ] && [ ! -f "$INSTALL_DIR/config.env" ]; then
+  "$INSTALL_DIR/$BIN_NAME" setup
+else
+  echo "检测到已有配置，跳过配置向导"
+fi
 
-# 安装 systemd 服务
+# 安装 systemd 服务（已安装则重启以加载新版本）
 if command -v systemctl >/dev/null 2>&1; then
   echo ""
-  "$INSTALL_DIR/$BIN_NAME" service install
+  if systemctl is-active --quiet redial 2>/dev/null; then
+    systemctl restart redial
+    echo "✅ 服务已重启（新版本生效）"
+  else
+    "$INSTALL_DIR/$BIN_NAME" service install
+  fi
 else
   echo "未检测到 systemd，手动启动："
   echo "  nohup $BIN_NAME >> bot.log 2>&1 &"
