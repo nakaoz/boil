@@ -1,17 +1,22 @@
 use anyhow::Context as _;
-use dialoguer::{Input, Password};
+use dialoguer::{Confirm, Input, Password};
 use std::{io::BufRead as _, path::PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub boil_account: String,
     pub boil_password: String,
-    pub tg_token: String,
-    pub tg_chat_id: String,
+    pub tg_token: Option<String>,
+    pub tg_chat_id: Option<String>,
+}
+
+impl Config {
+    pub fn has_tg(&self) -> bool {
+        self.tg_token.is_some() && self.tg_chat_id.is_some()
+    }
 }
 
 fn config_path() -> PathBuf {
-    // 优先查找可执行文件同目录下的 config.env
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("config.env")))
@@ -29,8 +34,8 @@ pub fn load() -> anyhow::Result<Config> {
     Ok(Config {
         boil_account: std::env::var("BOIL_ACCOUNT").context("缺少 BOIL_ACCOUNT 配置")?,
         boil_password: std::env::var("BOIL_PASSWORD").context("缺少 BOIL_PASSWORD 配置")?,
-        tg_token: std::env::var("TG_TOKEN").context("缺少 TG_TOKEN 配置")?,
-        tg_chat_id: std::env::var("TG_CHAT_ID").context("缺少 TG_CHAT_ID 配置")?,
+        tg_token: std::env::var("TG_TOKEN").ok(),
+        tg_chat_id: std::env::var("TG_CHAT_ID").ok(),
     })
 }
 
@@ -45,7 +50,7 @@ pub async fn load_or_setup() -> anyhow::Result<Config> {
     }
 }
 
-async fn run_setup_wizard() -> anyhow::Result<()> {
+pub async fn run_setup_wizard() -> anyhow::Result<()> {
     let account: String = Input::new()
         .with_prompt("Boil 账号（邮箱）")
         .interact_text()?;
@@ -63,43 +68,48 @@ async fn run_setup_wizard() -> anyhow::Result<()> {
 
     let data = client.query_all().await?;
     println!("✅ 登录成功，找到以下服务器：\n");
-
     for item in &data.zone_items {
-        let ip = data
-            .get_ip(&item.router_id, &item.interface)
-            .unwrap_or("未知");
-        let tag = if item.nat_no_change {
-            "NAT 不可换"
-        } else {
-            "可换 IP ✅"
-        };
+        let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
+        let tag = if item.nat_no_change { "NAT 不可换" } else { "可换 IP ✅" };
         println!("  {} | IP: {} | {}", item.label, ip, tag);
     }
     println!();
 
-    let tg_token: String = Input::new()
-        .with_prompt("Telegram Bot Token（从 @BotFather 获取）")
-        .interact_text()?;
+    // TG 可选
+    let want_tg = Confirm::new()
+        .with_prompt("配置 Telegram Bot（用于远程控制，可选）")
+        .default(true)
+        .interact()?;
 
-    println!("\n请向你的机器人发送任意一条消息，然后按回车继续...");
-    let stdin = std::io::stdin();
-    stdin.lock().lines().next();
+    let (tg_token, tg_chat_id) = if want_tg {
+        let token: String = Input::new()
+            .with_prompt("Bot Token（从 @BotFather 获取）")
+            .interact_text()?;
 
-    let chat_id = detect_chat_id(&tg_token)
-        .await
-        .context("未检测到 chat_id，请确认已向机器人发送消息")?;
-    println!("✅ 检测到 chat_id: {}\n", chat_id);
+        println!("\n请向你的机器人发送任意消息，然后按回车继续...");
+        std::io::stdin().lock().lines().next();
 
-    let content = format!(
-        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\nTG_TOKEN='{}'\nTG_CHAT_ID='{}'\n",
+        let chat_id = detect_chat_id(&token)
+            .await
+            .context("未检测到 chat_id，请确认已向机器人发送消息")?;
+        println!("✅ 检测到 chat_id: {chat_id}\n");
+        (Some(token), Some(chat_id))
+    } else {
+        println!("已跳过 Telegram 配置，可使用 redial status/change 命令行操作\n");
+        (None, None)
+    };
+
+    let mut content = format!(
+        "BOIL_ACCOUNT='{}'\nBOIL_PASSWORD='{}'\n",
         account,
         password.replace('\'', "'\\''"),
-        tg_token,
-        chat_id,
     );
+    if let (Some(token), Some(chat_id)) = (tg_token, tg_chat_id) {
+        content.push_str(&format!("TG_TOKEN='{}'\nTG_CHAT_ID='{}'\n", token, chat_id));
+    }
+
     std::fs::write("config.env", content)?;
     println!("✅ 配置已保存到 config.env\n");
-
     Ok(())
 }
 
@@ -108,11 +118,7 @@ async fn detect_chat_id(token: &str) -> anyhow::Result<String> {
         "https://api.telegram.org/bot{}/getUpdates?offset=-1&limit=1",
         token
     );
-    let resp: serde_json::Value = reqwest::get(&url)
-        .await?
-        .json()
-        .await?;
-
+    let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
     resp["result"][0]["message"]["from"]["id"]
         .as_i64()
         .map(|id| id.to_string())

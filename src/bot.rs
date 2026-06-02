@@ -1,13 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use teloxide::{
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
     utils::command::BotCommands,
 };
-use tokio::time::sleep;
 
-use crate::{boil::BoilClient, config::Config};
+use crate::{boil::BoilClient, config::Config, core::do_reconnect};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "命令列表:")]
@@ -21,7 +20,12 @@ enum Command {
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let bot = Bot::new(&config.tg_token);
+    let token = config
+        .tg_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("未配置 TG_TOKEN，请运行 redial setup"))?;
+
+    let bot = Bot::new(token);
     let config = Arc::new(config);
 
     let handler = dptree::entry()
@@ -30,10 +34,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 .filter_command::<Command>()
                 .endpoint(handle_command),
         )
-        .branch(
-            Update::filter_callback_query()
-                .endpoint(handle_callback),
-        );
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![config])
@@ -51,20 +52,21 @@ async fn handle_command(
     cmd: Command,
     config: Arc<Config>,
 ) -> ResponseResult<()> {
-    if msg.chat.id.to_string() != config.tg_chat_id {
+    let chat_id_str = msg.chat.id.to_string();
+    if config.tg_chat_id.as_deref() != Some(&chat_id_str) {
         return Ok(());
     }
     match cmd {
         Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "👋 <b>Boil IP Bot</b>\n\n/status — 查看当前 IP 和今日剩余次数\n/change — 换 IP（重拨）",
+                "👋 <b>Redial Bot</b>\n\n/status — 查看当前 IP 和今日剩余次数\n/change — 换 IP（重拨）",
             )
             .parse_mode(ParseMode::Html)
             .await?;
         }
-        Command::Status => cmd_status(&bot, msg.chat.id, &config).await,
-        Command::Change => cmd_change(&bot, msg.chat.id, &config).await,
+        Command::Status => tg_status(&bot, msg.chat.id, &config).await,
+        Command::Change => tg_change(&bot, msg.chat.id, &config).await,
     }
     Ok(())
 }
@@ -74,7 +76,8 @@ async fn handle_callback(
     q: CallbackQuery,
     config: Arc<Config>,
 ) -> ResponseResult<()> {
-    if q.from.id.to_string() != config.tg_chat_id {
+    let uid = q.from.id.to_string();
+    if config.tg_chat_id.as_deref() != Some(&uid) {
         bot.answer_callback_query(&q.id).await?;
         return Ok(());
     }
@@ -89,14 +92,14 @@ async fn handle_callback(
         if let Some(rest) = data.strip_prefix("change:") {
             let mut parts = rest.splitn(2, ':');
             if let (Some(router_id), Some(interface)) = (parts.next(), parts.next()) {
-                do_reconnect(&bot, chat_id, &config, router_id, interface).await;
+                tg_do_reconnect(&bot, chat_id, &config, router_id, interface).await;
             }
         }
     }
     Ok(())
 }
 
-async fn cmd_status(bot: &Bot, chat_id: ChatId, config: &Config) {
+async fn tg_status(bot: &Bot, chat_id: ChatId, config: &Config) {
     let result = async {
         let c = BoilClient::new()?;
         c.login(&config.boil_account, &config.boil_password).await?;
@@ -111,9 +114,7 @@ async fn cmd_status(bot: &Bot, chat_id: ChatId, config: &Config) {
                 data.daily_used, data.daily_limit
             )];
             for item in &data.zone_items {
-                let ip = data
-                    .get_ip(&item.router_id, &item.interface)
-                    .unwrap_or("未知");
+                let ip = data.get_ip(&item.router_id, &item.interface).unwrap_or("未知");
                 let tag = if item.nat_no_change { "🔒 NAT" } else { "✅ 可换" };
                 lines.push(format!("{}\n<code>{}</code> | {}", item.label, ip, tag));
             }
@@ -123,14 +124,12 @@ async fn cmd_status(bot: &Bot, chat_id: ChatId, config: &Config) {
                 .await;
         }
         Err(e) => {
-            let _ = bot
-                .send_message(chat_id, format!("❌ 查询失败: {e}"))
-                .await;
+            let _ = bot.send_message(chat_id, format!("❌ 查询失败: {e}")).await;
         }
     }
 }
 
-async fn cmd_change(bot: &Bot, chat_id: ChatId, config: &Config) {
+async fn tg_change(bot: &Bot, chat_id: ChatId, config: &Config) {
     let result = async {
         let c = BoilClient::new()?;
         c.login(&config.boil_account, &config.boil_password).await?;
@@ -141,28 +140,23 @@ async fn cmd_change(bot: &Bot, chat_id: ChatId, config: &Config) {
     let data = match result {
         Ok(d) => d,
         Err(e) => {
-            let _ = bot
-                .send_message(chat_id, format!("❌ 登录失败: {e}"))
-                .await;
+            let _ = bot.send_message(chat_id, format!("❌ 登录失败: {e}")).await;
             return;
         }
     };
 
     let changeable = data.changeable();
     if changeable.is_empty() {
-        let _ = bot
-            .send_message(chat_id, "⚠️ 没有可换 IP 的服务器")
-            .await;
+        let _ = bot.send_message(chat_id, "⚠️ 没有可换 IP 的服务器").await;
         return;
     }
 
     if changeable.len() == 1 {
         let r = changeable[0];
-        do_reconnect(bot, chat_id, config, &r.router_id, &r.interface).await;
+        tg_do_reconnect(bot, chat_id, config, &r.router_id, &r.interface).await;
         return;
     }
 
-    // 多台:内联键盘选择
     let buttons: Vec<Vec<InlineKeyboardButton>> = changeable
         .iter()
         .map(|r| {
@@ -179,7 +173,7 @@ async fn cmd_change(bot: &Bot, chat_id: ChatId, config: &Config) {
         .await;
 }
 
-async fn do_reconnect(
+async fn tg_do_reconnect(
     bot: &Bot,
     chat_id: ChatId,
     config: &Config,
@@ -188,152 +182,43 @@ async fn do_reconnect(
 ) {
     let _ = bot.send_message(chat_id, "⏳ 开始换 IP，请稍候...").await;
 
-    let result = async {
-        let c = BoilClient::new()?;
-        c.login(&config.boil_account, &config.boil_password).await?;
-
-        let data = c.query_all().await?;
-        let old_ip = data.get_ip(router_id, interface).map(str::to_string);
-
-        anyhow::ensure!(
-            data.daily_limit == 0 || data.daily_used < data.daily_limit,
-            "今日额度已用尽（{}/{}），明日再试",
-            data.daily_used,
-            data.daily_limit
-        );
-
-        c.reconnect(router_id, interface).await?;
-
-        sleep(Duration::from_secs(8)).await;
-
-        let mut new_ip: Option<String> = None;
-        for _ in 0..10u8 {
-            let d2 = c.query_all().await?;
-            let ip = d2.get_ip(router_id, interface).map(str::to_string);
-            if ip.is_some() && ip != old_ip {
-                new_ip = ip;
-                break;
+    match do_reconnect(config, router_id, interface).await {
+        Ok(res) => match res.new_ip {
+            Some(new_ip) => {
+                let reach = if res.reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
+                let quality_line = match &res.quality {
+                    Some(q) => format!(
+                        "\n\n📊 <b>IP 质量</b>\n地区: {}\nISP: {}\n类型: {}\nCF 风险: {}",
+                        q.country, q.isp, q.ip_type(), q.cf_risk()
+                    ),
+                    None => String::new(),
+                };
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        format!(
+                            "✅ <b>换 IP 完成</b>\n旧 IP: <code>{}</code>\n新 IP: <code>{new_ip}</code> <i>{reach}</i>{quality_line}",
+                            res.old_ip.as_deref().unwrap_or("未知"),
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
             }
-            sleep(Duration::from_secs(3)).await;
-        }
-
-        anyhow::Ok((old_ip, new_ip))
-    }
-    .await;
-
-    match result {
-        Ok((old_ip, Some(new_ip))) => {
-            let (reachable, quality) = tokio::join!(
-                check_reachable(&new_ip),
-                check_ip_quality(&new_ip),
-            );
-            let reach = if reachable { "TCP 可达 ✅" } else { "TCP 未通 ⚠️" };
-
-            let quality_line = match &quality {
-                Some(q) => format!(
-                    "\n\n📊 <b>IP 质量</b>\n地区: {}\nISP: {}\n类型: {}\nCF 风险: {}",
-                    q.country, q.isp, q.ip_type(), q.cf_risk()
-                ),
-                None => String::new(),
-            };
-
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    format!(
-                        "✅ <b>换 IP 完成</b>\n旧 IP: <code>{}</code>\n新 IP: <code>{new_ip}</code> <i>{reach}</i>{quality_line}",
-                        old_ip.as_deref().unwrap_or("未知"),
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await;
-        }
-        Ok((old_ip, None)) => {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    format!(
-                        "⚠️ 重拨已触发，但未检测到 IP 变化\n旧 IP: <code>{}</code>\n请到面板手动确认",
-                        old_ip.as_deref().unwrap_or("未知"),
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await;
-        }
+            None => {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        format!(
+                            "⚠️ 重拨已触发，但未检测到 IP 变化\n旧 IP: <code>{}</code>\n请到面板手动确认",
+                            res.old_ip.as_deref().unwrap_or("未知"),
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+            }
+        },
         Err(e) => {
-            let _ = bot
-                .send_message(chat_id, format!("❌ 换 IP 失败: {e}"))
-                .await;
+            let _ = bot.send_message(chat_id, format!("❌ 换 IP 失败: {e}")).await;
         }
     }
-}
-
-struct IpQuality {
-    country: String,
-    isp: String,
-    is_proxy: bool,
-    is_hosting: bool,
-}
-
-impl IpQuality {
-    fn cf_risk(&self) -> &'static str {
-        if self.is_proxy || self.is_hosting {
-            "高 ⚠️"
-        } else {
-            "低 ✅"
-        }
-    }
-
-    fn ip_type(&self) -> &'static str {
-        if self.is_proxy {
-            "代理 ❌"
-        } else if self.is_hosting {
-            "机房 ⚠️"
-        } else {
-            "住宅 ✅"
-        }
-    }
-}
-
-async fn check_ip_quality(ip: &str) -> Option<IpQuality> {
-    // ip-api.com 免费接口，HTTP only（HTTPS 需付费）
-    let url = format!(
-        "http://ip-api.com/json/{ip}?fields=status,country,isp,proxy,hosting"
-    );
-    let resp: serde_json::Value = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    if resp["status"].as_str() != Some("success") {
-        return None;
-    }
-
-    Some(IpQuality {
-        country: resp["country"].as_str().unwrap_or("未知").to_string(),
-        isp: resp["isp"].as_str().unwrap_or("未知").to_string(),
-        is_proxy: resp["proxy"].as_bool().unwrap_or(false),
-        is_hosting: resp["hosting"].as_bool().unwrap_or(false),
-    })
-}
-
-async fn check_reachable(ip: &str) -> bool {
-    for port in [80u16, 443, 22] {
-        if tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect(format!("{ip}:{port}")),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-        {
-            return true;
-        }
-    }
-    false
 }
