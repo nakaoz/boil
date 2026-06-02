@@ -48,7 +48,15 @@ fi
 echo ""
 echo "✅ 安装完成: $INSTALL_DIR/$BIN_NAME"
 echo ""
-echo "运行以下命令启动（首次自动引导配置）:"
-echo ""
-echo "  $BIN_NAME"
-echo ""
+
+# 首次配置
+"$INSTALL_DIR/$BIN_NAME" setup
+
+# 安装 systemd 服务
+if command -v systemctl >/dev/null 2>&1; then
+  echo ""
+  "$INSTALL_DIR/$BIN_NAME" service install
+else
+  echo "未检测到 systemd，手动启动："
+  echo "  nohup $BIN_NAME >> bot.log 2>&1 &"
+fi
