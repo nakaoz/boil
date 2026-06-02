@@ -86,26 +86,16 @@ impl BoilClient {
     }
 
     async fn test_session(&self) -> bool {
-        self.client
+        // 直接尝试解析为 QueryAllResponse，成功才算 session 有效
+        match self.client
             .post(format!("{BOIL_URL}/api/query_all"))
             .json(&serde_json::json!({}))
             .send()
             .await
-            .ok()
-            .and_then(|r| {
-                // 有效 session 返回 JSON；失效时 Flask 返回 HTML 登录页
-                if r.headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("application/json"))
-                    .unwrap_or(false)
-                {
-                    Some(true)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(false)
+        {
+            Ok(resp) => resp.json::<QueryAllResponse>().await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     async fn do_login(&self, account: &str, password: &str) -> anyhow::Result<()> {
