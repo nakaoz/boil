@@ -25,6 +25,8 @@ enum Commands {
     Check,
     /// 换 IP（重拨）
     Change,
+    /// 后台守护进程：有 TG 则启动机器人，有 cron 则运行定时任务（系统服务使用此命令）
+    Daemon,
     /// 启动 Telegram 机器人（需配置 TG）
     Bot,
     /// 重新运行配置向导
@@ -58,12 +60,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => {
             let config = config::load_or_setup().await?;
-            if config.has_tg() {
-                println!("启动 Telegram 机器人...");
-                bot::run(config).await?;
-            } else {
-                interactive_menu(&config).await?;
-            }
+            interactive_menu(&config).await?;
         }
         Some(Commands::Status) => {
             let config = config::load_or_setup().await?;
@@ -76,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Change) => {
             let config = config::load_or_setup().await?;
             cli::cmd_change(&config).await?;
+        }
+        Some(Commands::Daemon) => {
+            let config = config::load_or_setup().await?;
+            run_daemon(config).await?;
         }
         Some(Commands::Bot) => {
             let config = config::load_or_setup().await?;
@@ -92,6 +93,34 @@ async fn main() -> anyhow::Result<()> {
             ServiceAction::Install => service::install()?,
             ServiceAction::Uninstall => service::uninstall()?,
         },
+    }
+
+    Ok(())
+}
+
+/// 系统服务入口：有 TG 跑 bot（含定时器），只有 cron 跑纯定时器，都没有则报错
+async fn run_daemon(config: config::Config) -> anyhow::Result<()> {
+    let has_tg = config.has_tg();
+    let has_cron = config.change_cron.is_some();
+
+    anyhow::ensure!(
+        has_tg || has_cron,
+        "守护进程无事可做：请配置 Telegram Bot 或定时换 IP（boil timer \"0 */6 * * *\"）"
+    );
+
+    if has_tg {
+        // bot::run 内部已处理 cron，一起跑
+        bot::run(config).await?;
+    } else {
+        // 只有 cron，纯定时模式
+        println!("定时换 IP 模式启动，cron: {}", config.change_cron.as_deref().unwrap());
+        use std::sync::Arc;
+        let cfg = Arc::new(config);
+        let _sched = timer::start(cfg).await?;
+        // 阻塞保持进程存活
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
     }
 
     Ok(())
