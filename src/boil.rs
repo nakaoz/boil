@@ -77,11 +77,12 @@ impl BoilClient {
         Ok(Self { client, jar })
     }
 
-    /// 有缓存 cookie 直接复用，否则重新登录
+    /// 确保持有有效 session：用缓存 cookie 发一次 query_all 验证，失败则重新登录
     pub async fn login(&self, account: &str, password: &str) -> anyhow::Result<()> {
-        if cookie_path().exists() {
+        if self.query_all().await.is_ok() {
             return Ok(());
         }
+        let _ = std::fs::remove_file(cookie_path());
         self.do_login(account, password).await
     }
 
@@ -157,7 +158,7 @@ impl BoilClient {
     }
 
     pub async fn reconnect(&self, router_id: &str, interface: &str) -> anyhow::Result<()> {
-        self.client
+        let body = self.client
             .post(format!("{BOIL_URL}/api/reconnect"))
             .json(&serde_json::json!({
                 "router_id": router_id,
@@ -167,7 +168,22 @@ impl BoilClient {
             .await
             .context("reconnect 请求失败")?
             .error_for_status()
-            .context("reconnect 返回错误状态")?;
+            .context("reconnect 返回错误状态")?
+            .text()
+            .await
+            .context("reconnect 读取响应失败")?;
+
+        log::debug!("reconnect 响应: {}", &body[..body.len().min(300)]);
+
+        // 检查业务层面的失败（服务器可能返回 HTTP 200 但 body 携带错误信息）
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            if v.get("error").is_some()
+                || v.get("success").and_then(|s| s.as_bool()) == Some(false)
+            {
+                anyhow::bail!("reconnect 被服务器拒绝: {}", &body[..body.len().min(300)]);
+            }
+        }
+
         Ok(())
     }
 }
