@@ -79,7 +79,7 @@ impl BoilClient {
 
     /// 确保持有有效 session：用缓存 cookie 发一次 query_all 验证，失败则重新登录
     pub async fn login(&self, account: &str, password: &str) -> anyhow::Result<()> {
-        if self.query_all().await.is_ok() {
+        if cookie_path().exists() && self.query_all().await.is_ok() {
             return Ok(());
         }
         let _ = std::fs::remove_file(cookie_path());
