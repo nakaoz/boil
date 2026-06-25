@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-REPO="0xUnixIO/boil"
+REPO="nakaoz/boil"
 BIN_NAME="boil"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 

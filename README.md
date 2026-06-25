@@ -13,7 +13,7 @@
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0xUnixIO/boil/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nakaoz/boil/main/install.sh | bash
 ```
 
 支持平台：Linux x86_64 / aarch64
@@ -55,7 +55,7 @@ boil setup                   # 重新运行配置向导
 ## 从源码编译
 
 ```bash
-git clone https://github.com/0xUnixIO/boil.git
+git clone https://github.com/nakaoz/boil.git
 cd boil
 cargo build --release
 ./target/release/boil

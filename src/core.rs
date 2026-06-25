@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
@@ -44,17 +44,29 @@ pub async fn do_reconnect(
     );
 
     c.reconnect(router_id, interface).await?;
-    sleep(Duration::from_secs(8)).await;
+
+    // 重拨后最多等待 60 秒检测 IP 变化。先给面板/拨号链路 8 秒缓冲，
+    // 然后每 3 秒查询一次；最后一次 sleep 会按剩余时间截断，避免超过总等待上限。
+    let ip_change_timeout = Duration::from_secs(60);
+    let reconnect_wait = Duration::from_secs(8);
+    let poll_interval = Duration::from_secs(3);
+    let started_at = Instant::now();
+    sleep(reconnect_wait).await;
 
     let mut new_ip: Option<String> = None;
-    for _ in 0..10u8 {
+    loop {
         let d2 = c.query_all().await?;
         let ip = d2.get_ip(router_id, interface).map(str::to_string);
         if ip.is_some() && ip != old_ip {
             new_ip = ip;
             break;
         }
-        sleep(Duration::from_secs(3)).await;
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= ip_change_timeout {
+            break;
+        }
+        sleep(std::cmp::min(poll_interval, ip_change_timeout - elapsed)).await;
     }
 
     let (reachable, quality) = match &new_ip {

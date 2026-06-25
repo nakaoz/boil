@@ -25,9 +25,9 @@ fi
 
 BASE_URL="https://ippanel.boil.network"
 
-# 换 IP 后等待重拨完成的秒数 / 轮询次数
+# 换 IP 后最多等待检测新 IP 的总秒数 / 初始等待 / 轮询间隔
+IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-60}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-8}"
-POLL_TIMES="${POLL_TIMES:-10}"
 POLL_INTERVAL="${POLL_INTERVAL:-3}"
 
 # ---------- 临时 cookie 罐 ----------
@@ -119,18 +119,28 @@ cmd_change() {
   resp="$(reconnect)"
   log "reconnect 返回: $resp"
 
-  log "等待重拨完成(${RECONNECT_WAIT}s)..."
+  log "等待重拨完成(${RECONNECT_WAIT}s)，最多检测 ${IP_CHANGE_TIMEOUT}s ..."
+  local deadline
+  deadline=$((SECONDS + IP_CHANGE_TIMEOUT))
   sleep "$RECONNECT_WAIT"
 
   # 轮询直到 IP 变化或超时
-  local i
-  for ((i=1; i<=POLL_TIMES; i++)); do
+  local i=1
+  while true; do
     new_ip="$(api_post /api/query_all '{}' | extract_ip || true)"
     if [ -n "$new_ip" ] && [ "$new_ip" != "$old_ip" ]; then
       break
     fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      break
+    fi
     log "第 $i 次查询: 当前 ${new_ip:-未知},等待 IP 变化..."
-    sleep "$POLL_INTERVAL"
+    local remaining sleep_for
+    remaining=$((deadline - SECONDS))
+    sleep_for="$POLL_INTERVAL"
+    [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
+    [ "$sleep_for" -gt 0 ] && sleep "$sleep_for"
+    i=$((i + 1))
   done
 
   if [ -z "${new_ip:-}" ]; then

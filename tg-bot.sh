@@ -23,8 +23,8 @@ CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.env}"
 BASE_URL="https://ippanel.boil.network"
 TG_API="https://api.telegram.org/bot${TG_TOKEN}"
 
+IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-60}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-8}"
-POLL_TIMES="${POLL_TIMES:-10}"
 POLL_INTERVAL="${POLL_INTERVAL:-3}"
 
 # ---------- TG 工具 ----------
@@ -104,16 +104,26 @@ do_change() {
     "{\"router_id\":\"$BOIL_ROUTER_ID\",\"interface\":\"$BOIL_INTERFACE\"}" \
     -o /dev/null 2>/dev/null || true
 
+  local deadline
+  deadline=$((SECONDS + IP_CHANGE_TIMEOUT))
   sleep "$RECONNECT_WAIT"
 
   # 轮询新 IP
-  local new_ip i
-  for ((i=1; i<=POLL_TIMES; i++)); do
+  local new_ip i=1
+  while true; do
     new_ip="$(api_post /api/query_all '{}' | extract_ip || true)"
     if [ -n "$new_ip" ] && [ "$new_ip" != "$old_ip" ]; then
       break
     fi
-    sleep "$POLL_INTERVAL"
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      break
+    fi
+    local remaining sleep_for
+    remaining=$((deadline - SECONDS))
+    sleep_for="$POLL_INTERVAL"
+    [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
+    [ "$sleep_for" -gt 0 ] && sleep "$sleep_for"
+    i=$((i + 1))
   done
 
   rm -f "$COOKIE_JAR"; COOKIE_JAR=""
