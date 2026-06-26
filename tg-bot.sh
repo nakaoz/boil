@@ -23,9 +23,9 @@ CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.env}"
 BASE_URL="https://ippanel.boil.network"
 TG_API="https://api.telegram.org/bot${TG_TOKEN}"
 
-IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-60}"
-RECONNECT_WAIT="${RECONNECT_WAIT:-8}"
-POLL_INTERVAL="${POLL_INTERVAL:-3}"
+IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-120}"
+RECONNECT_WAIT="${RECONNECT_WAIT:-15}"
+POLL_INTERVAL="${POLL_INTERVAL:-8}"
 
 # ---------- TG 工具 ----------
 tg_send() {

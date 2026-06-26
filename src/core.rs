@@ -45,11 +45,11 @@ pub async fn do_reconnect(
 
     c.reconnect(router_id, interface).await?;
 
-    // 重拨后最多等待 60 秒检测 IP 变化。先给面板/拨号链路 8 秒缓冲，
-    // 然后每 3 秒查询一次；最后一次 sleep 会按剩余时间截断，避免超过总等待上限。
-    let ip_change_timeout = Duration::from_secs(60);
-    let reconnect_wait = Duration::from_secs(8);
-    let poll_interval = Duration::from_secs(3);
+    // 重拨后最多等待 120 秒检测 IP 变化。先给面板/拨号链路 15 秒缓冲，
+    // 然后每 8 秒查询一次，避免触发 query_all 的频率限制；最后一次 sleep 会按剩余时间截断，避免超过总等待上限。
+    let ip_change_timeout = Duration::from_secs(120);
+    let reconnect_wait = Duration::from_secs(15);
+    let poll_interval = Duration::from_secs(8);
     let started_at = Instant::now();
     sleep(reconnect_wait).await;
 

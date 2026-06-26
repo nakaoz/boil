@@ -26,9 +26,9 @@ fi
 BASE_URL="https://ippanel.boil.network"
 
 # 换 IP 后最多等待检测新 IP 的总秒数 / 初始等待 / 轮询间隔
-IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-60}"
-RECONNECT_WAIT="${RECONNECT_WAIT:-8}"
-POLL_INTERVAL="${POLL_INTERVAL:-3}"
+IP_CHANGE_TIMEOUT="${IP_CHANGE_TIMEOUT:-120}"
+RECONNECT_WAIT="${RECONNECT_WAIT:-15}"
+POLL_INTERVAL="${POLL_INTERVAL:-8}"
 
 # ---------- 临时 cookie 罐 ----------
 COOKIE_JAR="$(mktemp -t boil-cookie.XXXXXX)"
